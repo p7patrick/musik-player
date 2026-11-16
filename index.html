@@ -183,15 +183,35 @@ const heart = on => `<svg width="26" height="26" viewBox="0 0 24 24" fill="${on?
 /* ---------- Storage (IndexedDB, mit Fallback auf Arbeitsspeicher) ---------- */
 let db = null;
 const mem = { tracks: new Map(), files: new Map() };
+let dbError = '';
 function openDB(){
   return new Promise(res => {
+    const fail = msg => { if(!db && !dbError){ dbError = msg; } res(); };
+    const to = setTimeout(() => fail('Der Speicher antwortet nicht.'), 10000);
     try {
       const r = indexedDB.open('meinplayer', 1);
       r.onupgradeneeded = () => { const d = r.result; d.createObjectStore('tracks',{keyPath:'id'}); d.createObjectStore('files'); };
-      r.onsuccess = () => { db = r.result; res(); };
-      r.onerror = () => res();
-    } catch(e){ res(); }
+      r.onsuccess = () => { clearTimeout(to); db = r.result; db.onversionchange = () => db.close(); res(); };
+      r.onerror = () => { clearTimeout(to); fail('Fehler: ' + (r.error && (r.error.name+' '+r.error.message) || 'unbekannt')); };
+      r.onblocked = () => fail('Die App ist noch in einem anderen Fenster geöffnet.');
+    } catch(e){ clearTimeout(to); fail('Fehler: ' + e.message); }
   });
+}
+/* Speicherstatus: dauerhaft geschützt? wie viel belegt? */
+async function storageInfo(){
+  const out = {persisted:null, usage:0, quota:0};
+  try{ if(navigator.storage){
+    out.persisted = navigator.storage.persisted ? await navigator.storage.persisted() : null;
+    if(!out.persisted && navigator.storage.persist) out.persisted = await navigator.storage.persist();
+    if(navigator.storage.estimate){ const e = await navigator.storage.estimate(); out.usage = e.usage||0; out.quota = e.quota||0; }
+  }}catch(e){}
+  return out;
+}
+const fmtMB = b => b > 1e9 ? (b/1e9).toFixed(1).replace('.',',')+' GB' : Math.round(b/1e6)+' MB';
+async function storageLine(){
+  const i = await storageInfo();
+  const prot = i.persisted ? '🔒 dauerhaft geschützt' : (i.persisted===false ? '⚠️ nicht geschützt – Chrome darf bei Platzmangel löschen' : '');
+  return `${tracks.length} Titel · ${fmtMB(i.usage)} belegt${i.quota?' von '+fmtMB(i.quota):''}${prot?'<br>'+prot:''}`;
 }
 function tx(store, mode, fn){
   if(!db) return Promise.resolve(fn(null));
@@ -298,6 +318,7 @@ function toast(msg){ const el=$('toast'); el.textContent=msg; el.classList.add('
 async function addFiles(fileList, fromDir){
   const files = [...fileList].filter(f => f.type.startsWith('audio/') || /\.(mp3|m4a|aac|flac|ogg|opus|wav)$/i.test(f.name));
   if(!files.length){ toast('Keine Audiodateien gefunden'); return; }
+  if(!db){ toast('Speicher nicht erreichbar – bitte App neu starten'); return; }
   try{ navigator.storage && navigator.storage.persist && navigator.storage.persist(); }catch(e){}
   const prog = $('progress'); prog.classList.remove('hidden');
   const existing = new Map(tracks.map(t=>[t.name+'|'+t.size, t]));
@@ -389,11 +410,19 @@ function render(){
   if(navReady) ls.set('nav', {view, drill});
   $('backBtn').style.display = drill ? '' : 'none';
   $('viewTitle').textContent = drill ? drill.name : 'Meine Musik';
+  if(!db && dbError){
+    $('metaRow').classList.add('hidden');
+    L.innerHTML = `<div class="empty"><h2>Musik-Speicher nicht erreichbar</h2>Deine Lieder sind vermutlich noch da, die App kommt gerade nur nicht an sie heran.<br><small>${esc(dbError)}</small><br><br>
+      Schließ die App ganz (auch aus den zuletzt geöffneten Apps wegwischen) und öffne sie neu.<br><br><button class="btn" data-act="reload">Neu laden</button></div>`;
+    return;
+  }
   if(!tracks.length){
     $('metaRow').classList.add('hidden');
     L.innerHTML = `<div class="empty"><div style="display:grid;place-items:center;color:#ff7a45">${ICON_NOTE.replace(/22/g,'56')}</div>
       <h2>Noch keine Musik</h2>Füge MP3s von deinem Handy hinzu. Sie werden in der App gespeichert und sind beim nächsten Öffnen wieder da.<br><br>
-      <button class="btn" data-act="files">Dateien auswählen</button><br><button class="btn ghost" data-act="dir">Ganzen Ordner wählen</button></div>`;
+      <button class="btn" data-act="files">Dateien auswählen</button><br><button class="btn ghost" data-act="dir">Ganzen Ordner wählen</button>
+      <div id="emptyStore" style="margin-top:22px;font-size:12px"></div></div>`;
+    storageLine().then(h => { const el = $('emptyStore'); if(el) el.innerHTML = 'Speicher: '+h; });
     return;
   }
   $('metaRow').classList.remove('hidden');
@@ -607,7 +636,9 @@ function sleepMenu(){
 /* ---------- Events ---------- */
 $('addBtn').onclick = () => {
   openSheet(`<h3>Musik hinzufügen</h3><button class="opt" data-a="files">🎵&nbsp; Dateien auswählen</button><button class="opt" data-a="dir">📁&nbsp; Ganzen Ordner wählen</button>
-    <div style="padding:6px 22px 4px;color:#9a98a6;font-size:13px;line-height:1.45">Tipp: Wählst du einen übergeordneten Ordner (z. B. „Music“), werden alle Unterordner auf einmal übernommen. Nach jedem Ordner kannst du direkt den nächsten hinzufügen.</div>`);
+    <div style="padding:6px 22px 4px;color:#9a98a6;font-size:13px;line-height:1.45">Tipp: Wählst du einen übergeordneten Ordner (z. B. „Music“), werden alle Unterordner auf einmal übernommen. Nach jedem Ordner kannst du direkt den nächsten hinzufügen.</div>
+    <div id="storeInfo" style="padding:10px 22px 0;color:#9a98a6;font-size:12px;line-height:1.5;border-top:1px solid #2c2c38;margin-top:10px"></div>`);
+  storageLine().then(h => { const el = $('storeInfo'); if(el) el.innerHTML = 'Speicher: '+h; });
   $('sheet').onclick = e => { const a = e.target.closest('[data-a]')?.dataset.a; if(!a) return; closeSheet(); $(a==='dir'?'dirIn':'fileIn').click(); };
 };
 $('fileIn').onchange = e => { addFiles(e.target.files); e.target.value=''; };
@@ -620,7 +651,7 @@ $('backBtn').onclick = () => {
 $('tabs').onclick = e => { const b = e.target.closest('.tab'); if(!b) return;
   document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('on', x===b)); view = b.dataset.v; drill = null; $('list').scrollTop=0; render(); };
 $('list').onclick = e => {
-  const act = e.target.closest('[data-act]')?.dataset.act; if(act){ $(act==='dir'?'dirIn':'fileIn').click(); return; }
+  const act = e.target.closest('[data-act]')?.dataset.act; if(act==='reload'){ location.reload(); return; } if(act){ $(act==='dir'?'dirIn':'fileIn').click(); return; }
   const more = e.target.closest('[data-more]'); if(more){ trackMenu(more.dataset.more); return; }
   const fo = e.target.closest('[data-folder]'); if(fo){ openFolder(fo.dataset.folder); return; }
   const g = e.target.closest('[data-group]'); if(g){ drill = {type: view==='artists'?'artist':'album', name: g.dataset.group}; $('list').scrollTop=0; render(); return; }
@@ -655,6 +686,7 @@ $('full').addEventListener('touchend', e => { if(ty!=null && e.changedTouches[0]
 (async () => {
   updatePlayIcons(); updateModes();
   await openDB();
+  storageInfo();
   try{ tracks = await dbAllTracks(); }catch(e){ tracks = []; }
   // Zuletzt geöffneten Bereich/Ordner wiederherstellen
   const nav = ls.get('nav', null);
