@@ -1,4 +1,4 @@
-const CACHE = 'musik-player-v1';
+const CACHE = 'musik-player-v2';
 const APP = ['./', './index.html', './manifest.json', './icons/icon-192.png', './icons/icon-512.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(APP))); self.skipWaiting(); });
 self.addEventListener('activate', e => {

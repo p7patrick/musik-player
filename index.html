@@ -120,6 +120,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;heigh
   <button class="tab" data-v="fav">Favoriten</button>
   <button class="tab" data-v="artists">Künstler</button>
   <button class="tab" data-v="albums">Alben</button>
+  <button class="tab" data-v="folders">Ordner</button>
   <button class="tab" data-v="recent">Neu hinzugefügt</button>
 </div>
 <div id="progress" class="hidden"></div>
@@ -294,47 +295,94 @@ const albumOf = t => t.album || 'Unbekanntes Album';
 function toast(msg){ const el=$('toast'); el.textContent=msg; el.classList.add('show'); clearTimeout(toast.t); toast.t=setTimeout(()=>el.classList.remove('show'),2000); }
 
 /* ---------- Hinzufügen ---------- */
-async function addFiles(fileList){
+async function addFiles(fileList, fromDir){
   const files = [...fileList].filter(f => f.type.startsWith('audio/') || /\.(mp3|m4a|aac|flac|ogg|opus|wav)$/i.test(f.name));
   if(!files.length){ toast('Keine Audiodateien gefunden'); return; }
   try{ navigator.storage && navigator.storage.persist && navigator.storage.persist(); }catch(e){}
   const prog = $('progress'); prog.classList.remove('hidden');
-  const existing = new Set(tracks.map(t=>t.name+'|'+t.size));
+  const existing = new Map(tracks.map(t=>[t.name+'|'+t.size, t]));
   let added = 0, n = 0;
   for(const f of files){
     n++; prog.textContent = `Füge hinzu … ${n} / ${files.length}`;
-    if(existing.has(f.name+'|'+f.size)) continue;
+    const rel = f.webkitRelativePath || '';
+    const folder = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
+    const old = existing.get(f.name+'|'+f.size);
+    if(old){ // schon vorhanden: nur Ordner nachtragen
+      if(folder && !old.folder){ old.folder = folder; try{ await dbPutTrack(old); }catch(e){} }
+      continue;
+    }
     const tags = await readTags(f);
     const guess = guessFromName(f.name);
     const blob = new Blob([await f.arrayBuffer()], {type: f.type || 'audio/mpeg'});
     const t = {
       id: Date.now().toString(36)+Math.random().toString(36).slice(2,8),
-      name: f.name, size: f.size,
+      name: f.name, size: f.size, folder,
       title: tags.title || guess.title, artist: tags.artist || guess.artist || '', album: tags.album || '',
       trackNo: tags.trackNo || 0, cover: tags.cover || null,
       duration: await getDuration(blob), fav: false, added: Date.now()
     };
     try{ await dbPutFile(t.id, blob); await dbPutTrack(t); }
     catch(e){ toast('Speicher voll – nicht alles gespeichert'); break; }
-    tracks.push(t); existing.add(f.name+'|'+f.size); added++;
+    tracks.push(t); existing.set(f.name+'|'+f.size, t); added++;
     if(added % 10 === 0) render();
   }
   prog.classList.add('hidden');
   render();
-  toast(added ? `${added} Titel hinzugefügt` : 'Schon alles in der Bibliothek');
+  const msg = added ? `${added} Titel hinzugefügt` : 'Schon alles in der Bibliothek';
+  if(fromDir){
+    openSheet(`<h3>${msg}</h3><button class="opt" data-a="dir">📁&nbsp; Noch einen Ordner hinzufügen</button><button class="opt" data-a="done">✓&nbsp; Fertig</button>`);
+    $('sheet').onclick = e => { const a = e.target.closest('[data-a]')?.dataset.a; if(!a) return; closeSheet(); if(a==='dir') $('dirIn').click(); };
+  } else toast(msg);
 }
 
+/* ---------- Ordner ---------- */
+const NOF = '\u0001ohne';
+const folderOf = t => t.folder || '';
+const lastSeg = p => p===NOF ? 'Ohne Ordner' : (p.split('/').pop() || p);
+function inTree(t, p){ const f = folderOf(t); if(p==='') return true; if(p===NOF) return !f; return f===p || f.startsWith(p+'/'); }
+function subFolders(p){
+  const set = new Set();
+  for(const t of tracks){
+    const f = folderOf(t);
+    if(p===''){ if(f) set.add(f.split('/')[0]); }
+    else if(p!==NOF && f.startsWith(p+'/')){ set.add(p+'/'+f.slice(p.length+1).split('/')[0]); }
+  }
+  const list = [...set].sort((a,b)=>a.localeCompare(b,'de',{numeric:true,sensitivity:'base'}));
+  if(p==='' && tracks.some(t=>!folderOf(t))) list.push(NOF);
+  return list;
+}
+const curFolder = () => (drill && drill.type==='folder') ? drill.path : '';
+function openFolder(path){ drill = {type:'folder', path, name: lastSeg(path)}; $('list').scrollTop = 0; render(); }
+const FOLDER_ICON = '<svg width="24" height="24" viewBox="0 0 24 24" fill="#ff9a62"><path d="M3 6a2 2 0 012-2h4l2 2h8a2 2 0 012 2v10a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>';
+
 /* ---------- Liste ---------- */
+const matches = (t,q) => !q || (t.title+' '+t.artist+' '+t.album+' '+folderOf(t)).toLowerCase().includes(q);
 function filtered(){
   const q = query.toLowerCase();
-  let list = tracks.filter(t => !q || (t.title+' '+t.artist+' '+t.album).toLowerCase().includes(q));
+  let list = tracks.filter(t => matches(t,q));
   if(view==='fav') list = list.filter(t=>t.fav);
+  if(view==='folders'){
+    const p = curFolder();
+    list = q ? list.filter(t=>inTree(t,p)) : list.filter(t => p===NOF ? !folderOf(t) : folderOf(t)===p);
+    return list.sort((a,b)=>a.name.localeCompare(b.name,'de',{numeric:true,sensitivity:'base'}));
+  }
   if(drill) list = list.filter(t => (drill.type==='artist'?artistOf(t):albumOf(t))===drill.name);
   if(view==='recent' && !drill) list = [...list].sort((a,b)=>b.added-a.added).slice(0,100);
   else if(drill && drill.type==='album') list.sort((a,b)=>(a.trackNo||999)-(b.trackNo||999)||a.title.localeCompare(b.title));
   else list.sort((a,b)=>a.title.localeCompare(b.title,'de',{sensitivity:'base'}));
   return list;
 }
+// Was „Zufallswiedergabe“ abspielt: im Ordner auch alle Unterordner
+function scopeList(){
+  if(view!=='folders') return filtered();
+  const q = query.toLowerCase(), p = curFolder();
+  return tracks.filter(t => inTree(t,p) && matches(t,q));
+}
+const trackRow = (t,cur) => `<div class="track${t.id===cur?' playing':''}" data-id="${t.id}">
+      <div class="cover">${coverHtml(t)}</div>
+      <div class="tinfo"><div class="ttitle">${esc(t.title)}</div><div class="tsub">${esc(artistOf(t))}${t.album?' · '+esc(t.album):''}</div></div>
+      <button class="more" data-more="${t.id}" aria-label="Optionen"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg></button>
+    </div>`;
 function render(){
   const L = $('list');
   $('backBtn').style.display = drill ? '' : 'none';
@@ -347,6 +395,20 @@ function render(){
     return;
   }
   $('metaRow').classList.remove('hidden');
+  const cur = queue[qi];
+  if(view==='folders'){
+    const p = curFolder();
+    const subs = query ? [] : subFolders(p);
+    const list = filtered();
+    const all = scopeList();
+    $('shuffleAll').style.display = all.length ? '' : 'none';
+    $('count').textContent = query ? `${list.length} Titel` : `${subs.length ? subs.length+' Ordner · ' : ''}${list.length} Titel${subs.length?' · '+all.length+' gesamt':''}`;
+    const rows = subs.map(f => { const n = tracks.filter(t=>inTree(t,f)).length;
+      return `<div class="group" data-folder="${esc(f)}"><div class="cover">${FOLDER_ICON}</div><div class="tinfo"><div class="ttitle">${esc(lastSeg(f))}</div><div class="tsub">${n} Titel</div></div></div>`; }).join('');
+    L.innerHTML = (rows + list.map(t=>trackRow(t,cur)).join('')) ||
+      `<div class="empty">${query?'Nichts gefunden.':'Keine Ordner. Ordner-Infos gibt es für Musik, die du über „Ganzen Ordner wählen“ hinzufügst.'}</div>`;
+    return;
+  }
   if((view==='artists'||view==='albums') && !drill){
     const key = view==='artists' ? artistOf : albumOf;
     const groups = new Map();
@@ -362,12 +424,7 @@ function render(){
   $('shuffleAll').style.display='';
   const total = list.reduce((s,t)=>s+(t.duration||0),0);
   $('count').textContent = `${list.length} Titel · ${Math.round(total/60)} Min.`;
-  const cur = queue[qi];
-  L.innerHTML = list.length ? list.map(t => `<div class="track${t.id===cur?' playing':''}" data-id="${t.id}">
-      <div class="cover">${coverHtml(t)}</div>
-      <div class="tinfo"><div class="ttitle">${esc(t.title)}</div><div class="tsub">${esc(artistOf(t))}${t.album?' · '+esc(t.album):''}</div></div>
-      <button class="more" data-more="${t.id}" aria-label="Optionen"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg></button>
-    </div>`).join('')
+  L.innerHTML = list.length ? list.map(t=>trackRow(t,cur)).join('')
     : `<div class="empty">${view==='fav'?'Noch keine Favoriten. Tippe im Player auf das Herz.':'Nichts gefunden.'}</div>`;
 }
 
@@ -484,6 +541,7 @@ function trackMenu(id){
     <button class="opt" data-o="fav">${t.fav?'♡&nbsp; Aus Favoriten entfernen':'♥&nbsp; Zu Favoriten'}</button>
     <button class="opt" data-o="artist">👤&nbsp; Zum Künstler</button>
     <button class="opt" data-o="album">💿&nbsp; Zum Album</button>
+    ${t.folder?'<button class="opt" data-o="folder">📁&nbsp; Zum Ordner</button>':''}
     <button class="opt danger" data-o="del">🗑&nbsp; Aus der Bibliothek löschen</button>`);
   $('sheet').onclick = async e => {
     const o = e.target.closest('[data-o]')?.dataset.o; if(!o) return;
@@ -496,6 +554,7 @@ function trackMenu(id){
     if(o==='fav') await toggleFav(id);
     if(o==='artist'){ drill = {type:'artist', name: artistOf(t)}; render(); }
     if(o==='album'){ drill = {type:'album', name: albumOf(t)}; render(); }
+    if(o==='folder'){ view = 'folders'; document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('on', x.dataset.v==='folders')); $('closeFull').click(); openFolder(t.folder); }
     if(o==='del'){
       openSheet(`<h3>„${esc(t.title)}“ löschen?</h3><div style="padding:0 22px 8px;color:#9a98a6;font-size:14px">Die Datei auf deinem Handy bleibt erhalten, nur die Kopie in der App wird entfernt.</div>
         <button class="opt danger" data-o="delyes">Löschen</button><button class="opt" data-o="cancel">Abbrechen</button>`);
@@ -545,22 +604,27 @@ function sleepMenu(){
 
 /* ---------- Events ---------- */
 $('addBtn').onclick = () => {
-  openSheet(`<h3>Musik hinzufügen</h3><button class="opt" data-a="files">🎵&nbsp; Dateien auswählen</button><button class="opt" data-a="dir">📁&nbsp; Ganzen Ordner wählen</button>`);
+  openSheet(`<h3>Musik hinzufügen</h3><button class="opt" data-a="files">🎵&nbsp; Dateien auswählen</button><button class="opt" data-a="dir">📁&nbsp; Ganzen Ordner wählen</button>
+    <div style="padding:6px 22px 4px;color:#9a98a6;font-size:13px;line-height:1.45">Tipp: Wählst du einen übergeordneten Ordner (z. B. „Music“), werden alle Unterordner auf einmal übernommen. Nach jedem Ordner kannst du direkt den nächsten hinzufügen.</div>`);
   $('sheet').onclick = e => { const a = e.target.closest('[data-a]')?.dataset.a; if(!a) return; closeSheet(); $(a==='dir'?'dirIn':'fileIn').click(); };
 };
 $('fileIn').onchange = e => { addFiles(e.target.files); e.target.value=''; };
-$('dirIn').onchange = e => { addFiles(e.target.files); e.target.value=''; };
+$('dirIn').onchange = e => { addFiles(e.target.files, true); e.target.value=''; };
 $('q').oninput = e => { query = e.target.value; render(); };
-$('backBtn').onclick = () => { drill = null; render(); };
+$('backBtn').onclick = () => {
+  if(drill && drill.type==='folder' && drill.path!==NOF && drill.path.includes('/')) openFolder(drill.path.slice(0, drill.path.lastIndexOf('/')));
+  else { drill = null; render(); }
+};
 $('tabs').onclick = e => { const b = e.target.closest('.tab'); if(!b) return;
   document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('on', x===b)); view = b.dataset.v; drill = null; $('list').scrollTop=0; render(); };
 $('list').onclick = e => {
   const act = e.target.closest('[data-act]')?.dataset.act; if(act){ $(act==='dir'?'dirIn':'fileIn').click(); return; }
   const more = e.target.closest('[data-more]'); if(more){ trackMenu(more.dataset.more); return; }
+  const fo = e.target.closest('[data-folder]'); if(fo){ openFolder(fo.dataset.folder); return; }
   const g = e.target.closest('[data-group]'); if(g){ drill = {type: view==='artists'?'artist':'album', name: g.dataset.group}; $('list').scrollTop=0; render(); return; }
   const tr = e.target.closest('[data-id]'); if(tr){ playList(filtered().map(t=>t.id), tr.dataset.id); }
 };
-$('shuffleAll').onclick = () => { const l = filtered(); if(!l.length) return; shuffle = true; ls.set('shuffle',true); updateModes();
+$('shuffleAll').onclick = () => { const l = scopeList(); if(!l.length) return; shuffle = true; ls.set('shuffle',true); updateModes();
   const ids = l.map(t=>t.id); playList(ids, ids[Math.floor(Math.random()*ids.length)]); };
 $('miniPlay').onclick = e => { e.stopPropagation(); togglePlay(); };
 $('miniNext').onclick = e => { e.stopPropagation(); next(false); };
