@@ -383,8 +383,10 @@ const trackRow = (t,cur) => `<div class="track${t.id===cur?' playing':''}" data-
       <div class="tinfo"><div class="ttitle">${esc(t.title)}</div><div class="tsub">${esc(artistOf(t))}${t.album?' · '+esc(t.album):''}</div></div>
       <button class="more" data-more="${t.id}" aria-label="Optionen"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg></button>
     </div>`;
+let navReady = false;
 function render(){
   const L = $('list');
+  if(navReady) ls.set('nav', {view, drill});
   $('backBtn').style.display = drill ? '' : 'none';
   $('viewTitle').textContent = drill ? drill.name : 'Meine Musik';
   if(!tracks.length){
@@ -654,7 +656,20 @@ $('full').addEventListener('touchend', e => { if(ty!=null && e.changedTouches[0]
   updatePlayIcons(); updateModes();
   await openDB();
   try{ tracks = await dbAllTracks(); }catch(e){ tracks = []; }
+  // Zuletzt geöffneten Bereich/Ordner wiederherstellen
+  const nav = ls.get('nav', null);
+  if(nav && document.querySelector(`.tab[data-v="${nav.view}"]`)){
+    view = nav.view; drill = nav.drill || null;
+    if(drill && drill.type==='folder' && !tracks.some(t=>inTree(t, drill.path))) drill = null;
+    if(drill && drill.type!=='folder' && !tracks.some(t=>(drill.type==='artist'?artistOf(t):albumOf(t))===drill.name)) drill = null;
+    document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('on', x.dataset.v===view));
+    document.querySelector('.tab.on')?.scrollIntoView({inline:'center', block:'nearest'});
+  }
+  navReady = true;
   render();
+  $('list').scrollTop = ls.get('scroll', 0);
+  let st; $('list').addEventListener('scroll', () => { clearTimeout(st); st = setTimeout(()=>ls.set('scroll', $('list').scrollTop), 200); }, {passive:true});
+  document.addEventListener('visibilitychange', () => { if(document.hidden) ls.set('scroll', $('list').scrollTop); });
   const last = ls.get('last', null);
   if(last && last.queue){
     queue = last.queue.filter(id=>byId(id)); baseOrder = (last.baseOrder||queue).filter(id=>byId(id));
